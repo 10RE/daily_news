@@ -420,56 +420,176 @@ def call_gemini(prompt):
 # ============================================================
 
 def send_to_feishu(report_text, arxiv_data, github_data, news_data):
-    """通过飞书自定义机器人 Webhook 发送报告（只推送 AI 摘要卡片）"""
+    """通过飞书自定义机器人 Webhook 推送——按大主题拆成3-4张卡片"""
     if not FEISHU_WEBHOOK_URL:
         print("  未配置 FEISHU_WEBHOOK_URL，跳过飞书推送")
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    sections = []
+    # 按大主题切分：识别关键章节标题作为卡片分界
+    # 关键章节包括：VLA/端到端、世界模型、仿真、具身智能、趋势总结等
+    chunks = _split_report_by_topic(report_text)
 
-    # AI 摘要（包含内嵌论文/新闻链接）
-    sections.append({
-        "tag": "markdown",
-        "content": _feishu_md(report_text[:4500]),
-    })
+    if not chunks:
+        # 兜底：如果切分失败，就按字符数粗分成 2 块
+        mid = len(report_text) // 2
+        chunks = [report_text[:mid], report_text[mid:]]
 
-    # 热门开源项目（简短）
-    gh_lines = []
-    count = 0
-    for topic, repos in github_data.items():
-        for r in repos[:2]:
-            count += 1
-            if count > 6:
-                break
-            gh_lines.append(f"{count}. [{r['name']}]({r['url']}) ⭐{r['stars']}")
-        if count > 6:
-            break
+    total = len(chunks) + 1  # +1 给 GitHub 卡片
 
-    if gh_lines:
-        sections.append({"tag": "hr"})
-        sections.append({"tag": "markdown", "content": "**热门开源项目**\n" + "\n".join(gh_lines)})
-
-    card = {
+    # —— 第一张：封面 + 报告开头 ——
+    header, first_body = _extract_header_and_first_chunk(chunks[0])
+    card0 = {
         "msg_type": "interactive",
         "card": {
             "header": {
                 "title": {"tag": "plain_text", "content": f"📰 每日研究简报 {today}"},
                 "template": "blue",
             },
-            "elements": sections,
+            "elements": [{"tag": "markdown", "content": _feishu_md(first_body[:5000])}],
         },
     }
+    _post_feishu(card0, f"封面 ({header})")
+    time.sleep(0.4)
 
-    _post_feishu(card, "每日简报")
+    # —— 中间卡片：各主题章节 ——
+    for idx, chunk in enumerate(chunks[1:], 2):
+        # 提取该 chunk 的第一行作为卡片标题（通常是 **章节名**）
+        title, body = _extract_header_and_first_chunk(chunk)
+        title = title[:30] if title else f"第 {idx-1} 部分"
+
+        # 如果 body 过长，切成子卡
+        sub_chunks = _chunk_text(body, 5000)
+        for j, sub in enumerate(sub_chunks, 1):
+            sub_title = title if j == 1 else f"{title}（续）"
+            card = {
+                "msg_type": "interactive",
+                "card": {
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"📄 {sub_title}"},
+                        "template": "green",
+                    },
+                    "elements": [{"tag": "markdown", "content": _feishu_md(sub)}],
+                },
+            }
+            _post_feishu(card, f"{idx}-{j}/{total}")
+            time.sleep(0.4)
+
+    # —— 最后一张：GitHub 项目 ——
+    gh_lines = ["**热门开源项目**\n"]
+    count = 0
+    for topic, repos in github_data.items():
+        for r in repos[:2]:
+            count += 1
+            if count > 8:
+                break
+            gh_lines.append(f"{count}. [{r['name']}]({r['url']}) ⭐{r['stars']}")
+        if count > 8:
+            break
+
+    if len(gh_lines) > 1:
+        card = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": "💻 开源项目速览"},
+                    "template": "orange",
+                },
+                "elements": [{"tag": "markdown", "content": "\n".join(gh_lines)}],
+            },
+        }
+        _post_feishu(card, "项目")
+
+
+def _split_report_by_topic(text):
+    """按大主题切分报告。识别模式：一行只有 **标题文字**，且标题含领域关键词"""
+    lines = text.split("\n")
+    sections = []
+    current = []
+    topic_keywords = ["VLA", "端到端", "世界模型", "仿真", "具身智能", "具身", "人形机器人",
+                      "趋势", "总结", "行业", "新闻", "点评", "开源", "开源项目"]
+
+    for line in lines:
+        stripped = line.strip()
+        # 判断是否是章节标题：整行 **xxx** 形式，且包含领域关键词
+        is_heading = False
+        if (stripped.startswith("**") and stripped.endswith("**") and 4 < len(stripped) < 80):
+            title_inner = stripped[2:-2].strip()
+            if any(k in title_inner for k in topic_keywords):
+                is_heading = True
+            # 也允许一些不含关键词的、明显的章节短标题（不含冒号/汉字超过3个）
+            elif "：" not in title_inner and ":" not in title_inner and len(title_inner) < 30:
+                is_heading = True
+
+        if is_heading and current:
+            sections.append("\n".join(current).strip())
+            current = [line]
+        else:
+            current.append(line)
+
+    if current:
+        sections.append("\n".join(current).strip())
+
+    # 去掉过短的片段
+    sections = [s for s in sections if len(s.strip()) > 50]
+
+    # 如果切得太碎（>6 段），合并相邻小段
+    while len(sections) > 6:
+        # 找最短的一段，合并到相邻段
+        min_idx = min(range(len(sections)), key=lambda i: len(sections[i]))
+        if min_idx > 0:
+            sections[min_idx - 1] = sections[min_idx - 1] + "\n\n" + sections[min_idx]
+        else:
+            sections[min_idx + 1] = sections[min_idx] + "\n\n" + sections[min_idx + 1]
+        sections.pop(min_idx)
+
+    return sections
+
+
+def _extract_header_and_first_chunk(chunk):
+    """从片段开头提取标题行，返回（标题, 剩余内容）"""
+    lines = chunk.strip().split("\n")
+    if not lines:
+        return "研究简报", chunk
+
+    header = lines[0].strip()
+    # 如果首行是 **xxx** 格式，提取其中的文字
+    m = re.match(r"\*\*(.+?)\*\*", header)
+    if m:
+        header_text = m.group(1).strip()[:30]
+        body = "\n".join(lines[1:]).strip() or chunk
+        return header_text, chunk
+    # 否则用前 20 字符作为标题
+    header_text = header[:30]
+    return header_text, chunk
+
+
+def _chunk_text(text, max_chars):
+    """按段落切分长文本"""
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current = ""
+    for p in paragraphs:
+        if len(current) + len(p) + 2 <= max_chars:
+            current = current + "\n\n" + p if current else p
+        else:
+            if current:
+                chunks.append(current)
+            current = p
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _feishu_md(text):
-    """将标准 Markdown 转换为飞书卡片兼容的 Markdown"""
-    # 飞书卡片不支持 # 标题语法，移除行首 #+ 前缀
+    """飞书卡片兼容的 Markdown 预处理"""
+    # 移除行首 # 标题语法（飞书卡片不支持）
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # 飞书卡片不支持 HTML 标签
+    # 移除 HTML 标签
     text = re.sub(r"</?details[^>]*>", "", text)
     text = re.sub(r"</?summary[^>]*>", "**", text)
     text = re.sub(r"<hr\s*/?>", "---", text)
@@ -565,7 +685,7 @@ def main():
     print(f"  共获取 {total_news} 条新闻")
 
     # 4. 生成摘要
-    print("\n[4/5] 生成 AI 摘要 ...")
+    print(f"\n[4/5] 生成 AI 摘要 (模型: {GEMINI_MODEL}) ...")
     prompt = build_prompt(arxiv_data, github_data, news_data)
     report_text = call_gemini(prompt)
     print(f"  摘要长度: {len(report_text)} 字符")
