@@ -420,7 +420,7 @@ def call_gemini(prompt):
 # ============================================================
 
 def send_to_feishu(report_text, arxiv_data, github_data, news_data):
-    """飞书推送：按主题切卡片，超长溢出到下一张"""
+    """飞书推送：超长溢出到下一张卡片"""
     if not FEISHU_WEBHOOK_URL:
         print("  未配置 FEISHU_WEBHOOK_URL，跳过飞书推送")
         return
@@ -428,38 +428,32 @@ def send_to_feishu(report_text, arxiv_data, github_data, news_data):
     today = datetime.now().strftime("%Y-%m-%d")
     MAX_CARD_CHARS = 6000
 
-    # 1) 按主题章节切分，返回 [(标题, 内容), ...]
-    topics = _split_topics(report_text)
-    print(f"  切分为 {len(topics)} 个主题")
+    # 按段落溢出切分
+    parts = _overflow_split(report_text, MAX_CARD_CHARS)
+    print(f"  切分为 {len(parts)} 张卡片")
 
-    # 2) 每个主题发卡片，超长溢出
-    for i, (title, body) in enumerate(topics):
-        # 首张卡片用蓝色封面样式，其他绿色
+    for i, part in enumerate(parts):
         if i == 0:
             card_title = f"📰 每日研究简报 {today}"
             template = "blue"
         else:
-            card_title = f"📄 {title}"
+            card_title = f"📰 每日研究简报 {today}（续{i}）"
             template = "green"
 
-        # 按段落溢出切分
-        parts = _overflow_split(body, MAX_CARD_CHARS)
-        for j, part in enumerate(parts):
-            suffix = f"（续{j}）" if j > 0 else ""
-            card = {
-                "msg_type": "interactive",
-                "card": {
-                    "header": {
-                        "title": {"tag": "plain_text", "content": f"{card_title}{suffix}"},
-                        "template": template,
-                    },
-                    "elements": [{"tag": "markdown", "content": _feishu_md(part)}],
+        card = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": card_title},
+                    "template": template,
                 },
-            }
-            _post_feishu(card, f"{title[:10]}-{j}")
-            time.sleep(0.4)
+                "elements": [{"tag": "markdown", "content": _feishu_md(part)}],
+            },
+        }
+        _post_feishu(card, f"card-{i}")
+        time.sleep(0.4)
 
-    # 3) GitHub 项目卡片
+    # GitHub 项目卡片
     gh_lines = ["**热门开源项目**\n"]
     count = 0
     for topic, repos in github_data.items():
@@ -483,51 +477,6 @@ def send_to_feishu(report_text, arxiv_data, github_data, news_data):
             },
         }
         _post_feishu(card, "项目")
-
-
-def _split_topics(text):
-    """按主题章节切分报告，返回 [(标题, 内容), ...]
-
-    只切 AI 解读部分（**xxx** 格式的章节标题），不切论文/新闻/GitHub 数据列表。
-    """
-    lines = text.split("\n")
-
-    # 找所有 **xxx** 格式的章节标题行
-    # 主题标题特征：整行就是 **xxx**，不含冒号，较短
-    topic_starts = []  # [(line_idx, title)]
-    for idx, line in enumerate(lines):
-        s = line.strip()
-        if not (s.startswith("**") and s.endswith("**")):
-            continue
-        if len(s) > 80 or len(s) < 4:
-            continue
-        inner = s[2:-2].strip()
-        # 排除数据列表章节
-        if " 论文" in inner or "- GitHub" in inner:
-            continue
-        if inner.endswith("新闻") and "业界新闻" not in inner:
-            continue
-        # 排除主标题
-        if "研究简报" in inner or "每日" in inner:
-            continue
-        # 这就是主题标题
-        topic_starts.append((idx, inner))
-
-    if not topic_starts:
-        print("  [WARN] 未找到主题标题，整篇作为一张卡片")
-        return [("研究简报", text)]
-
-    print(f"  识别到 {len(topic_starts)} 个主题: {', '.join(t[1][:15] for t in topic_starts)}")
-
-    # 切分：每个主题从标题行到下一个主题标题之前
-    results = []
-    for i, (start_idx, title) in enumerate(topic_starts):
-        end_idx = topic_starts[i + 1][0] if i + 1 < len(topic_starts) else len(lines)
-        body = "\n".join(lines[start_idx:end_idx]).strip()
-        if len(body) > 30:
-            results.append((title, body))
-
-    return results
 
 
 def _overflow_split(text, max_chars):
