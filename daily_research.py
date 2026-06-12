@@ -346,7 +346,7 @@ def call_gemini(prompt):
             model = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
-                config={"temperature": 0.3, "max_output_tokens": 8192},
+                config={"temperature": 0.3, "max_output_tokens": 16384},
             )
             text = model.text
             if text:
@@ -357,7 +357,7 @@ def call_gemini(prompt):
             model = genai.GenerativeModel(GEMINI_MODEL)
             response = model.generate_content(
                 prompt,
-                generation_config={"temperature": 0.3, "max_output_tokens": 8192},
+                generation_config={"temperature": 0.3, "max_output_tokens": 16384},
                 request_options={"timeout": 180},
             )
             text = response.text
