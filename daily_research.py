@@ -514,7 +514,10 @@ def _split_topics(text):
         topic_starts.append((idx, inner))
 
     if not topic_starts:
+        print("  [WARN] 未找到主题标题，整篇作为一张卡片")
         return [("研究简报", text)]
+
+    print(f"  识别到 {len(topic_starts)} 个主题: {', '.join(t[1][:15] for t in topic_starts)}")
 
     # 切分：每个主题从标题行到下一个主题标题之前
     results = []
