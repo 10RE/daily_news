@@ -1,5 +1,5 @@
 """
-自动驾驶 VLA 模型 / 世界模型 / 具身智能 每日研究简报
+自动驾驶 VLA 模型 / 世界模型 / 具身智能 研究简报
 数据源: arXiv + GitHub Trending
 摘要生成: Google Gemini API
 """
@@ -434,10 +434,10 @@ def send_to_feishu(report_text, arxiv_data, github_data, news_data):
 
     for i, part in enumerate(parts):
         if i == 0:
-            card_title = f"📰 每日研究简报 {today}"
+            card_title = f"📰 研究简报 {today}"
             template = "blue"
         else:
-            card_title = f"📰 每日研究简报 {today}（续{i}）"
+            card_title = f"📰 研究简报 {today}（续{i}）"
             template = "green"
 
         card = {
@@ -539,7 +539,7 @@ def save_report(report_text, arxiv_data, github_data, news_data):
     filepath = os.path.join(REPORT_DIR, f"{today}.md")
 
     # 组装完整报告
-    full_report = f"# 自动驾驶 & 具身智能 每日研究简报\n\n"
+    full_report = f"# 自动驾驶 & 具身智能 研究简报\n\n"
     full_report += f"**日期**: {today}\n\n---\n\n"
     full_report += report_text
     full_report += "\n\n---\n\n"
@@ -555,10 +555,10 @@ def save_report(report_text, arxiv_data, github_data, news_data):
         for a in articles:
             full_report += f"- [{a['title']}]({a['link']})\n"
 
-    for topic, repos in github_data.items():
-        full_report += f"\n### {topic} - GitHub\n\n"
-        for r in repos:
-            full_report += f"- [{r['name']}]({r['url']}) ⭐{r['stars']}\n"
+    # for topic, repos in github_data.items():
+    #     full_report += f"\n### {topic} - GitHub\n\n"
+    #     for r in repos:
+    #         full_report += f"- [{r['name']}]({r['url']}) ⭐{r['stars']}\n"
 
     full_report += "\n</details>\n"
 
@@ -575,7 +575,7 @@ def save_report(report_text, arxiv_data, github_data, news_data):
 
 def main():
     print("=" * 60)
-    print("自动驾驶 VLA / 世界模型 / 具身智能 每日研究简报")
+    print("自动驾驶 VLA / 世界模型 / 具身智能 研究简报")
     print("=" * 60)
 
     # 1. 抓取 arXiv
