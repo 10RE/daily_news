@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import re
 import time
+from email.utils import parsedate_to_datetime
 
 # ============================================================
 # 配置
@@ -85,7 +86,12 @@ NEWS_TOPICS = {
 }
 
 ARXIV_MAX_RESULTS = 8  # 每个关键词最多返回论文数
+ARXIV_TOPIC_MAX_RESULTS = 25
+ARXIV_MIN_REQUEST_INTERVAL = 3.2  # arXiv 要求同一连接最多约每 3 秒一次请求
+ARXIV_MAX_RETRIES = 4
 REPORT_DIR = os.environ.get("REPORT_DIR", "reports")
+
+_arxiv_last_request_at = 0.0
 
 # SSL 上下文：本地开发时跳过证书验证，GitHub Actions 环境不受影响
 _SSL_CTX = ssl.create_default_context()
@@ -97,9 +103,32 @@ if os.environ.get("PYTHONHTTPSVERIFY", "1") != "1":
 # arXiv 爬取
 # ============================================================
 
+def _arxiv_retry_delay(error, attempt):
+    """优先使用服务端 Retry-After；没有时采用带上限的指数退避。"""
+    retry_after = error.headers.get("Retry-After") if error.headers else None
+    if retry_after:
+        try:
+            return min(float(retry_after), 300)
+        except ValueError:
+            try:
+                return min(max(0, (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()), 300)
+            except (TypeError, ValueError):
+                pass
+    return min(15 * (2 ** attempt), 180)
+
+
+def _wait_for_arxiv_slot():
+    """在每次 arXiv 请求前执行全局限速，包含失败后的下一次尝试。"""
+    global _arxiv_last_request_at
+    wait_seconds = ARXIV_MIN_REQUEST_INTERVAL - (time.monotonic() - _arxiv_last_request_at)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    _arxiv_last_request_at = time.monotonic()
+
+
 def fetch_arxiv_papers(query, max_results=ARXIV_MAX_RESULTS):
-    """从 arXiv API 搜索论文"""
-    base_url = "http://export.arxiv.org/api/query?"
+    """从 arXiv API 搜索论文，并在临时错误或限流时谨慎重试。"""
+    base_url = "https://export.arxiv.org/api/query?"
     params = {
         "search_query": query,
         "sortBy": "submittedDate",
@@ -108,13 +137,30 @@ def fetch_arxiv_papers(query, max_results=ARXIV_MAX_RESULTS):
     }
     url = base_url + urllib.parse.urlencode(params)
 
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "AutoResearchBot/1.0"})
-        with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
-            data = resp.read().decode("utf-8")
-    except Exception as e:
-        print(f"  [WARN] arXiv 请求失败 ({query}): {e}", file=sys.stderr)
-        return []
+    for attempt in range(ARXIV_MAX_RETRIES + 1):
+        try:
+            _wait_for_arxiv_slot()
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "AutoResearchBot/1.1 (daily research digest)"},
+            )
+            with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
+                data = resp.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == ARXIV_MAX_RETRIES:
+                print(f"  [WARN] arXiv 请求失败 ({query}): HTTP {e.code} {e.reason}", file=sys.stderr)
+                return []
+            delay = _arxiv_retry_delay(e, attempt)
+            print(f"  [WARN] arXiv HTTP {e.code}，{delay:.0f} 秒后重试 ({attempt + 1}/{ARXIV_MAX_RETRIES})", file=sys.stderr)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == ARXIV_MAX_RETRIES:
+                print(f"  [WARN] arXiv 请求失败 ({query}): {e}", file=sys.stderr)
+                return []
+            delay = min(5 * (2 ** attempt), 60)
+            print(f"  [WARN] arXiv 网络错误，{delay:.0f} 秒后重试 ({attempt + 1}/{ARXIV_MAX_RETRIES})", file=sys.stderr)
+            time.sleep(delay)
 
     papers = []
     root = ET.fromstring(data)
@@ -151,13 +197,13 @@ def fetch_all_arxiv():
         print(f"正在抓取 arXiv: {topic} ...")
         seen_titles = set()
         papers = []
-        for kw in keywords:
-            results = fetch_arxiv_papers(kw)
-            for p in results:
-                if p["title"] not in seen_titles:
-                    seen_titles.add(p["title"])
-                    papers.append(p)
-            time.sleep(1)  # 避免请求过快
+        # 合并同一主题的关键词：从 16 次请求降至 4 次，也避免 arXiv 的限流。
+        combined_query = " OR ".join(f"({keyword})" for keyword in keywords)
+        results = fetch_arxiv_papers(combined_query, max_results=ARXIV_TOPIC_MAX_RESULTS)
+        for p in results:
+            if p["title"] not in seen_titles:
+                seen_titles.add(p["title"])
+                papers.append(p)
         # 按日期排序
         papers.sort(key=lambda x: x["date"], reverse=True)
         all_results[topic] = papers[:15]  # 每个主题最多15篇
