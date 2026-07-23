@@ -89,6 +89,7 @@ ARXIV_MAX_RESULTS = 8  # 每个关键词最多返回论文数
 ARXIV_TOPIC_MAX_RESULTS = 25
 ARXIV_MIN_REQUEST_INTERVAL = 3.2  # arXiv 要求同一连接最多约每 3 秒一次请求
 ARXIV_MAX_RETRIES = 4
+ARXIV_LOOKBACK_DAYS = 14
 REPORT_DIR = os.environ.get("REPORT_DIR", "reports")
 
 _arxiv_last_request_at = 0.0
@@ -192,6 +193,7 @@ def fetch_arxiv_papers(query, max_results=ARXIV_MAX_RESULTS):
 
 def fetch_all_arxiv():
     """抓取所有主题的 arXiv 论文"""
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=ARXIV_LOOKBACK_DAYS)).date()
     all_results = {}
     for topic, keywords in ARXIV_TOPICS.items():
         print(f"正在抓取 arXiv: {topic} ...")
@@ -201,7 +203,8 @@ def fetch_all_arxiv():
         combined_query = " OR ".join(f"({keyword})" for keyword in keywords)
         results = fetch_arxiv_papers(combined_query, max_results=ARXIV_TOPIC_MAX_RESULTS)
         for p in results:
-            if p["title"] not in seen_titles:
+            published_date = datetime.strptime(p["date"], "%Y-%m-%d").date()
+            if published_date >= cutoff_date and p["title"] not in seen_titles:
                 seen_titles.add(p["title"])
                 papers.append(p)
         # 按日期排序
@@ -334,29 +337,38 @@ def build_prompt(arxiv_data, github_data, news_data):
     """构建 Gemini 的 Prompt"""
     today = datetime.now().strftime("%Y-%m-%d")
 
+    has_arxiv_papers = any(arxiv_data.values())
     prompt = f"""你是一位自动驾驶与具身智能领域的研究分析师。请根据以下最新论文、新闻和开源项目，生成一份中文研究简报。
 
 IMPORTANT - 输出格式要求：
 1.  不要使用 #、##、### 等 markdown 标题语法。用加粗文字（**标题文字**）作为章节标题
-2.  对每篇解读的论文，在其解读内容的最后一行附上链接，格式：🔗 [论文标题](http://arxiv.org/abs/xxxx)
-3.  每条新闻点评后附上链接，格式：🔗 [新闻标题](url)
-4.  每个主题挑选最有价值的 3-4 篇论文和 2-3 条重要新闻进行重点解读
-5.  解读包括：核心创新点、技术路线、潜在影响
-6.  对热门开源项目做简要点评
-7.  最后给出"今日趋势总结"
+2.  仅可解读下方明确提供的论文、新闻和项目；绝不可编造论文标题、arXiv ID、链接、日期或技术细节
+3.  每篇论文解读须以对应的【Pxxx】标识开头，并且不要自行输出论文链接；程序会根据标识补入经验证链接
+4.  每条新闻点评后附上链接，格式：🔗 [新闻标题](url)
+5.  每个主题挑选最有价值的 3-4 篇论文和 2-3 条重要新闻进行重点解读
+6.  解读包括：核心创新点、技术路线、潜在影响
+7.  对热门开源项目做简要点评
+8.  最后给出"今日趋势总结"
 
 ---
 数据日期: {today}
 
 """
 
+    if not has_arxiv_papers:
+        prompt += "本期没有可用的 arXiv 论文数据：不要输出任何论文解读或论文链接，也不要用常识补写论文。\n"
+
+    paper_index = 1
     for topic, papers in arxiv_data.items():
+        if not papers:
+            continue
         prompt += f"\n【{topic}】最新论文\n\n"
         for i, p in enumerate(papers, 1):
-            prompt += f"{i}. {p['title']}\n"
+            p["brief_id"] = f"P{paper_index:03d}"
+            paper_index += 1
+            prompt += f"【{p['brief_id']}】 {p['title']}\n"
             prompt += f"   作者: {p['authors']}\n"
             prompt += f"   日期: {p['date']}\n"
-            prompt += f"   链接: {p['link']}\n"
             prompt += f"   摘要: {p['abstract']}\n\n"
 
     for topic, articles in news_data.items():
@@ -376,6 +388,26 @@ IMPORTANT - 输出格式要求：
             prompt += f"   描述: {r['description']}\n\n"
 
     return prompt
+
+
+def attach_verified_arxiv_links(report_text, arxiv_data):
+    """移除模型自行生成的 arXiv 链接，并根据论文编号插入原始数据中的链接。"""
+    paper_map = {
+        paper.get("brief_id"): paper
+        for papers in arxiv_data.values()
+        for paper in papers
+        if paper.get("brief_id")
+    }
+    # 不信任模型生成的论文链接，避免链接和解读错配。
+    report_text = re.sub(r"(?m)^🔗 \[[^\]]+\]\(https?://(?:export\.)?arxiv\.org/[^)]*\)\s*$\n?", "", report_text)
+
+    def replace_marker(match):
+        paper = paper_map.get(match.group(1))
+        if not paper:
+            return match.group(0)
+        return f"**{paper['title']}**\n🔗 [{paper['title']}]({paper['link']})\n"
+
+    return re.sub(r"【(P\d{3})】\s*", replace_marker, report_text)
 
 
 def call_gemini(prompt):
@@ -646,6 +678,7 @@ def main():
     print(f"\n[4/5] 生成 AI 摘要 (模型: {GEMINI_MODEL}) ...")
     prompt = build_prompt(arxiv_data, github_data, news_data)
     report_text = call_gemini(prompt)
+    report_text = attach_verified_arxiv_links(report_text, arxiv_data)
     print(f"  摘要长度: {len(report_text)} 字符")
 
     # 5. 保存 + 推送
