@@ -24,6 +24,7 @@ from email.utils import parsedate_to_datetime
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # arXiv 搜索关键词配置: 使用 ti:(标题) + abs:(摘要) 精确搜索
 ARXIV_TOPICS = {
@@ -93,6 +94,7 @@ ARXIV_LOOKBACK_DAYS = 14
 REPORT_DIR = os.environ.get("REPORT_DIR", "reports")
 
 _arxiv_last_request_at = 0.0
+_arxiv_rate_limited = False
 
 # SSL 上下文：本地开发时跳过证书验证，GitHub Actions 环境不受影响
 _SSL_CTX = ssl.create_default_context()
@@ -128,7 +130,11 @@ def _wait_for_arxiv_slot():
 
 
 def fetch_arxiv_papers(query, max_results=ARXIV_MAX_RESULTS):
-    """从 arXiv API 搜索论文，并在临时错误或限流时谨慎重试。"""
+    """从 arXiv API 搜索论文；同一轮遇到 429 后立即停止后续请求。"""
+    global _arxiv_rate_limited
+    if _arxiv_rate_limited:
+        print("  [WARN] arXiv 本轮已被限流，跳过后续主题", file=sys.stderr)
+        return []
     base_url = "https://export.arxiv.org/api/query?"
     params = {
         "search_query": query,
@@ -149,6 +155,11 @@ def fetch_arxiv_papers(query, max_results=ARXIV_MAX_RESULTS):
                 data = resp.read().decode("utf-8")
             break
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # GitHub Actions 使用共享出口；持续重试通常不会解除限流，只会拖慢整份简报。
+                _arxiv_rate_limited = True
+                print("  [WARN] arXiv HTTP 429，已停止本轮 arXiv 请求；简报将跳过论文部分", file=sys.stderr)
+                return []
             if e.code not in (429, 500, 502, 503, 504) or attempt == ARXIV_MAX_RETRIES:
                 print(f"  [WARN] arXiv 请求失败 ({query}): HTTP {e.code} {e.reason}", file=sys.stderr)
                 return []
@@ -230,10 +241,13 @@ def fetch_github_repos(query, max_results=5):
     url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(params)
 
     try:
-        req = urllib.request.Request(url, headers={
+        headers = {
             "User-Agent": "AutoResearchBot/1.0",
             "Accept": "application/vnd.github.v3+json",
-        })
+        }
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
