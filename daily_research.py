@@ -12,6 +12,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import xml.etree.ElementTree as ET
+import html
 from datetime import datetime, timedelta, timezone
 import re
 import time
@@ -91,6 +92,22 @@ ARXIV_TOPIC_MAX_RESULTS = 25
 ARXIV_MIN_REQUEST_INTERVAL = 3.2  # arXiv 要求同一连接最多约每 3 秒一次请求
 ARXIV_MAX_RETRIES = 4
 ARXIV_LOOKBACK_DAYS = 14
+ARXIV_RSS_CATEGORIES = ("cs.RO", "cs.AI", "cs.CV", "cs.LG", "cs.SY")
+ARXIV_RSS_TOPIC_KEYWORDS = {
+    "自动驾驶 VLA / 端到端": (
+        "autonomous driving", "autonomous vehicle", "self-driving", "vision-language-action",
+        "end-to-end driving", "robotaxi",
+    ),
+    "世界模型 / 生成式仿真": (
+        "world model", "video generation", "video prediction", "generative simulation",
+    ),
+    "自动驾驶仿真 / 数字孪生": (
+        "driving simulation", "autonomous driving", "digital twin", "driving simulator", "neural simulation",
+    ),
+    "具身智能": (
+        "embodied", "humanoid", "robot", "manipulation", "locomotion", "navigation", "vision-language-action",
+    ),
+}
 REPORT_DIR = os.environ.get("REPORT_DIR", "reports")
 
 _arxiv_last_request_at = 0.0
@@ -202,6 +219,53 @@ def fetch_arxiv_papers(query, max_results=ARXIV_MAX_RESULTS):
     return papers
 
 
+def fetch_arxiv_rss_papers():
+    """从 arXiv 分类 RSS 获取最新论文，作为搜索 API 限流时的备用源。"""
+    papers = []
+    seen_links = set()
+    dc_ns = "{http://purl.org/dc/elements/1.1/}"
+
+    for category in ARXIV_RSS_CATEGORIES:
+        url = f"https://rss.arxiv.org/rss/{category}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AutoResearchBot/1.1 (daily research digest)"})
+            with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
+                root = ET.fromstring(resp.read())
+        except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError) as e:
+            print(f"  [WARN] arXiv RSS 请求失败 ({category}): {e}", file=sys.stderr)
+            continue
+
+        for item in root.findall("./channel/item"):
+            link = (item.findtext("link") or "").strip()
+            title = re.sub(r"\s+", " ", (item.findtext("title") or "").strip())
+            description = html.unescape(item.findtext("description") or "")
+            abstract = re.sub(r"^arXiv:.*?Abstract:\s*", "", description, flags=re.DOTALL)
+            abstract = re.sub(r"\s+", " ", abstract).strip()
+            pub_date = item.findtext("pubDate") or ""
+            try:
+                published = parsedate_to_datetime(pub_date).date().isoformat()
+            except (TypeError, ValueError):
+                continue
+
+            if link and title and link not in seen_links:
+                seen_links.add(link)
+                papers.append({
+                    "title": title,
+                    "link": link,
+                    "authors": (item.findtext(f"{dc_ns}creator") or "Unknown").strip(),
+                    "date": published,
+                    "abstract": abstract[:500],
+                })
+        time.sleep(1)
+    return papers
+
+
+def _match_rss_topic(paper, topic):
+    """按标题和摘要筛选 RSS 中与主题相关的论文。"""
+    text = f"{paper['title']} {paper['abstract']}".lower()
+    return any(keyword in text for keyword in ARXIV_RSS_TOPIC_KEYWORDS[topic])
+
+
 def fetch_all_arxiv():
     """抓取所有主题的 arXiv 论文"""
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=ARXIV_LOOKBACK_DAYS)).date()
@@ -221,6 +285,16 @@ def fetch_all_arxiv():
         # 按日期排序
         papers.sort(key=lambda x: x["date"], reverse=True)
         all_results[topic] = papers[:15]  # 每个主题最多15篇
+
+    if _arxiv_rate_limited:
+        print("  arXiv 搜索 API 被限流，改用分类 RSS 备用源 ...")
+        rss_papers = fetch_arxiv_rss_papers()
+        for topic, papers in all_results.items():
+            if papers:
+                continue
+            fallback = [paper for paper in rss_papers if _match_rss_topic(paper, topic)]
+            fallback.sort(key=lambda x: x["date"], reverse=True)
+            all_results[topic] = fallback[:15]
     return all_results
 
 
