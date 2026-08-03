@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.error
 import xml.etree.ElementTree as ET
 import html
+from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 import re
 import time
@@ -260,6 +261,96 @@ def fetch_arxiv_rss_papers():
     return papers
 
 
+class _ArxivRecentPageParser(HTMLParser):
+    """解析 arXiv 分类 recent 页面中的论文标题、作者、链接与公告日期。"""
+    def __init__(self):
+        super().__init__()
+        self.papers = []
+        self.current_date = None
+        self._in_heading = False
+        self._heading_parts = []
+        self._capture = None
+        self._capture_parts = []
+        self._capture_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "h3":
+            self._in_heading = True
+            self._heading_parts = []
+        elif tag == "a" and attributes.get("title") == "Abstract":
+            href = attributes.get("href", "")
+            if href.startswith("/abs/"):
+                self.papers.append({"link": f"https://arxiv.org{href}", "date": self.current_date})
+        elif tag == "div" and self.papers:
+            css_class = attributes.get("class", "")
+            if "list-title" in css_class:
+                self._capture = "title"
+                self._capture_parts = []
+                self._capture_depth = 1
+            elif "list-authors" in css_class:
+                self._capture = "authors"
+                self._capture_parts = []
+                self._capture_depth = 1
+            elif self._capture:
+                self._capture_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag == "h3" and self._in_heading:
+            self._in_heading = False
+            heading = " ".join(self._heading_parts).strip()
+            date_text = heading.rsplit("for ", 1)[-1] if "for " in heading else heading
+            date_text = re.sub(r"\s*\(.*$", "", date_text).strip()
+            try:
+                self.current_date = parsedate_to_datetime(date_text).date().isoformat()
+            except (TypeError, ValueError):
+                try:
+                    self.current_date = datetime.strptime(date_text, "%a, %d %b %Y").date().isoformat()
+                except ValueError:
+                    pass
+        elif tag == "div" and self._capture:
+            self._capture_depth -= 1
+            if self._capture_depth == 0:
+                value = re.sub(r"\s+", " ", "".join(self._capture_parts)).strip()
+                value = re.sub(r"^(Title:|Authors:)\s*", "", value)
+                self.papers[-1][self._capture] = value
+                self._capture = None
+
+    def handle_data(self, data):
+        if self._in_heading:
+            self._heading_parts.append(data)
+        if self._capture:
+            self._capture_parts.append(data)
+
+
+def fetch_arxiv_recent_papers():
+    """从分类 recent 页面获取最近工作日的论文，解决周末 RSS 空频道问题。"""
+    papers = []
+    seen_links = set()
+    for category in ARXIV_RSS_CATEGORIES:
+        try:
+            req = urllib.request.Request(
+                f"https://arxiv.org/list/{category}/recent",
+                headers={"User-Agent": "AutoResearchBot/1.1 (daily research digest)"},
+            )
+            with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
+                page = resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            print(f"  [WARN] arXiv recent 页面请求失败 ({category}): {e}", file=sys.stderr)
+            continue
+
+        parser = _ArxivRecentPageParser()
+        parser.feed(page)
+        for paper in parser.papers:
+            if paper.get("title") and paper.get("date") and paper["link"] not in seen_links:
+                seen_links.add(paper["link"])
+                paper.setdefault("authors", "Unknown")
+                paper["abstract"] = ""
+                papers.append(paper)
+        time.sleep(1)
+    return papers
+
+
 def _match_rss_topic(paper, topic):
     """按标题和摘要筛选 RSS 中与主题相关的论文。"""
     text = f"{paper['title']} {paper['abstract']}".lower()
@@ -289,10 +380,16 @@ def fetch_all_arxiv():
     if _arxiv_rate_limited:
         print("  arXiv 搜索 API 被限流，改用分类 RSS 备用源 ...")
         rss_papers = fetch_arxiv_rss_papers()
+        if not rss_papers:
+            print("  arXiv RSS 在非工作日为空，改用 recent 页面获取最近工作日论文 ...")
+            rss_papers = fetch_arxiv_recent_papers()
         for topic, papers in all_results.items():
             if papers:
                 continue
-            fallback = [paper for paper in rss_papers if _match_rss_topic(paper, topic)]
+            fallback = [
+                paper for paper in rss_papers
+                if paper["date"] >= cutoff_date.isoformat() and _match_rss_topic(paper, topic)
+            ]
             fallback.sort(key=lambda x: x["date"], reverse=True)
             all_results[topic] = fallback[:15]
     return all_results
@@ -432,11 +529,12 @@ IMPORTANT - 输出格式要求：
 1.  不要使用 #、##、### 等 markdown 标题语法。用加粗文字（**标题文字**）作为章节标题
 2.  仅可解读下方明确提供的论文、新闻和项目；绝不可编造论文标题、arXiv ID、链接、日期或技术细节
 3.  每篇论文解读须以对应的【Pxxx】标识开头，并且不要自行输出论文链接；程序会根据标识补入经验证链接
-4.  每条新闻点评后附上链接，格式：🔗 [新闻标题](url)
-5.  每个主题挑选最有价值的 3-4 篇论文和 2-3 条重要新闻进行重点解读
-6.  解读包括：核心创新点、技术路线、潜在影响
-7.  对热门开源项目做简要点评
-8.  最后给出"今日趋势总结"
+4.  标注为“摘要不可用”的论文只能简要介绍标题和研究方向，并明确摘要不可用；不得推断核心创新、技术路线或实验结果
+5.  每条新闻点评后附上链接，格式：🔗 [新闻标题](url)
+6.  每个主题挑选最有价值的 3-4 篇论文和 2-3 条重要新闻进行重点解读
+7.  解读包括：核心创新点、技术路线、潜在影响
+8.  对热门开源项目做简要点评
+9.  最后给出"今日趋势总结"
 
 ---
 数据日期: {today}
@@ -457,7 +555,7 @@ IMPORTANT - 输出格式要求：
             prompt += f"【{p['brief_id']}】 {p['title']}\n"
             prompt += f"   作者: {p['authors']}\n"
             prompt += f"   日期: {p['date']}\n"
-            prompt += f"   摘要: {p['abstract']}\n\n"
+            prompt += f"   摘要: {p['abstract'] or '摘要不可用（来自 arXiv recent 备用源）'}\n\n"
 
     for topic, articles in news_data.items():
         prompt += f"\n【{topic}】业界新闻\n\n"
