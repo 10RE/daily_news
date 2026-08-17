@@ -91,7 +91,7 @@ NEWS_TOPICS = {
 
 ARXIV_MAX_RESULTS = 8  # 每个关键词最多返回论文数
 ARXIV_TOPIC_MAX_RESULTS = 25
-ARXIV_MIN_REQUEST_INTERVAL = 3.2  # arXiv 要求同一连接最多约每 3 秒一次请求
+ARXIV_MIN_REQUEST_INTERVAL = 5.0  # arXiv 规定至少每 3 秒一次；保守留出余量
 ARXIV_MAX_RETRIES = 4
 ARXIV_LOOKBACK_DAYS = 14
 ARXIV_RSS_CATEGORIES = ("cs.RO", "cs.AI", "cs.CV", "cs.LG", "cs.SY")
