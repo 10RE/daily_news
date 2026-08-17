@@ -109,6 +109,13 @@ ARXIV_RSS_TOPIC_KEYWORDS = {
         "embodied", "humanoid", "robot", "manipulation", "locomotion", "navigation", "vision-language-action",
     ),
 }
+CROSSREF_TOPIC_QUERIES = {
+    "自动驾驶 VLA / 端到端": "vision language action autonomous driving",
+    "世界模型 / 生成式仿真": "world model autonomous driving",
+    "自动驾驶仿真 / 数字孪生": "autonomous driving simulation digital twin",
+    "具身智能": "embodied intelligence humanoid robot",
+}
+CROSSREF_RESULTS_PER_TOPIC = 15
 REPORT_DIR = os.environ.get("REPORT_DIR", "reports")
 
 _arxiv_last_request_at = 0.0
@@ -357,6 +364,78 @@ def _match_rss_topic(paper, topic):
     return any(keyword in text for keyword in ARXIV_RSS_TOPIC_KEYWORDS[topic])
 
 
+def _crossref_date(item):
+    """从 Crossref 的多种发布日期字段取出 ISO 日期。"""
+    for field in ("published-online", "published-print", "published", "issued", "created"):
+        date_parts = item.get(field, {}).get("date-parts", [])
+        if date_parts and date_parts[0]:
+            parts = date_parts[0]
+            try:
+                return datetime(parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 1).date().isoformat()
+            except (TypeError, ValueError):
+                continue
+    return ""
+
+
+def _crossref_authors(item):
+    authors = []
+    for author in item.get("author", []):
+        name = " ".join(part for part in (author.get("given", ""), author.get("family", "")) if part).strip()
+        if name:
+            authors.append(name)
+    result = ", ".join(authors[:3]) or "Unknown"
+    return f"{result} et al." if len(authors) > 3 else result
+
+
+def fetch_crossref_papers(query, cutoff_date, max_results=CROSSREF_RESULTS_PER_TOPIC):
+    """通过 Crossref REST API 获取近期 DOI 文献，作为 arXiv 不可用时的独立备用源。"""
+    params = {
+        "query.title": query,
+        "filter": f"from-pub-date:{cutoff_date.isoformat()},until-pub-date:{datetime.now(timezone.utc).date().isoformat()}",
+        "sort": "score",
+        "order": "desc",
+        "rows": max_results,
+        "select": "title,DOI,URL,author,abstract,published-online,published-print,published,issued,created",
+    }
+    url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AutoResearchBot/1.2 (daily research digest)"})
+        with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
+            items = json.loads(resp.read().decode("utf-8")).get("message", {}).get("items", [])
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"  [WARN] Crossref 请求失败 ({query}): {e}", file=sys.stderr)
+        return []
+
+    papers = []
+    for item in items:
+        title = re.sub(r"\s+", " ", " ".join(item.get("title", [])).strip())
+        link = (item.get("URL") or (f"https://doi.org/{item['DOI']}" if item.get("DOI") else "")).strip()
+        published = _crossref_date(item)
+        if not title or not link or not published or not (cutoff_date.isoformat() <= published <= datetime.now(timezone.utc).date().isoformat()):
+            continue
+        abstract = html.unescape(re.sub(r"<[^>]+>", " ", item.get("abstract", "")))
+        papers.append({
+            "title": title,
+            "link": link,
+            "authors": _crossref_authors(item),
+            "date": published,
+            "abstract": re.sub(r"\s+", " ", abstract).strip()[:500],
+            "source": "Crossref",
+        })
+    return papers
+
+
+def fetch_all_crossref(cutoff_date):
+    """按主题抓取 Crossref；仅使用有 DOI URL 的可验证记录。"""
+    results = {}
+    for topic, query in CROSSREF_TOPIC_QUERIES.items():
+        print(f"正在抓取 Crossref: {topic} ...")
+        papers = fetch_crossref_papers(query, cutoff_date)
+        results[topic] = [paper for paper in papers if paper["date"] >= cutoff_date.isoformat()][:15]
+        time.sleep(1)
+    return results
+
+
 def fetch_all_arxiv():
     """抓取所有主题的 arXiv 论文"""
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=ARXIV_LOOKBACK_DAYS)).date()
@@ -392,6 +471,9 @@ def fetch_all_arxiv():
             ]
             fallback.sort(key=lambda x: x["date"], reverse=True)
             all_results[topic] = fallback[:15]
+    if not any(all_results.values()):
+        print("  arXiv 备用源无近期论文，改用 Crossref DOI 文献索引 ...")
+        all_results = fetch_all_crossref(cutoff_date)
     return all_results
 
 
