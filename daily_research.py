@@ -27,6 +27,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+CROSSREF_MAILTO = os.environ.get("CROSSREF_MAILTO", "")
 
 # arXiv 搜索关键词配置: 使用 ti:(标题) + abs:(摘要) 精确搜索
 ARXIV_TOPICS = {
@@ -116,10 +117,13 @@ CROSSREF_TOPIC_QUERIES = {
     "具身智能": "embodied intelligence humanoid robot",
 }
 CROSSREF_RESULTS_PER_TOPIC = 15
+CROSSREF_MIN_REQUEST_INTERVAL = 1.1  # Public 池上限为 5 req/s；保守串行限速
+CROSSREF_MAX_RETRIES = 3
 REPORT_DIR = os.environ.get("REPORT_DIR", "reports")
 
 _arxiv_last_request_at = 0.0
 _arxiv_rate_limited = False
+_crossref_last_request_at = 0.0
 
 # SSL 上下文：本地开发时跳过证书验证，GitHub Actions 环境不受影响
 _SSL_CTX = ssl.create_default_context()
@@ -387,6 +391,15 @@ def _crossref_authors(item):
     return f"{result} et al." if len(authors) > 3 else result
 
 
+def _wait_for_crossref_slot():
+    """Crossref 请求全局串行限速，满足 Public 池的并发和频率限制。"""
+    global _crossref_last_request_at
+    wait_seconds = CROSSREF_MIN_REQUEST_INTERVAL - (time.monotonic() - _crossref_last_request_at)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    _crossref_last_request_at = time.monotonic()
+
+
 def fetch_crossref_papers(query, cutoff_date, max_results=CROSSREF_RESULTS_PER_TOPIC):
     """通过 Crossref REST API 获取近期 DOI 文献，作为 arXiv 不可用时的独立备用源。"""
     params = {
@@ -397,14 +410,29 @@ def fetch_crossref_papers(query, cutoff_date, max_results=CROSSREF_RESULTS_PER_T
         "rows": max_results,
         "select": "title,DOI,URL,author,abstract,published-online,published-print,published,issued,created",
     }
+    if CROSSREF_MAILTO:
+        params["mailto"] = CROSSREF_MAILTO
     url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "AutoResearchBot/1.2 (daily research digest)"})
-        with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
-            items = json.loads(resp.read().decode("utf-8")).get("message", {}).get("items", [])
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
-        print(f"  [WARN] Crossref 请求失败 ({query}): {e}", file=sys.stderr)
-        return []
+    user_agent = "AutoResearchBot/1.2 (daily research digest)"
+    if CROSSREF_MAILTO:
+        user_agent = f"AutoResearchBot/1.2 (mailto:{CROSSREF_MAILTO})"
+    for attempt in range(CROSSREF_MAX_RETRIES + 1):
+        try:
+            _wait_for_crossref_slot()
+            req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+            with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
+                items = json.loads(resp.read().decode("utf-8")).get("message", {}).get("items", [])
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == CROSSREF_MAX_RETRIES:
+                print(f"  [WARN] Crossref 请求失败 ({query}): HTTP {e.code} {e.reason}", file=sys.stderr)
+                return []
+            delay = _arxiv_retry_delay(e, attempt)
+            print(f"  [WARN] Crossref HTTP 429，{delay:.0f} 秒后重试 ({attempt + 1}/{CROSSREF_MAX_RETRIES})", file=sys.stderr)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            print(f"  [WARN] Crossref 请求失败 ({query}): {e}", file=sys.stderr)
+            return []
 
     papers = []
     for item in items:
@@ -432,7 +460,6 @@ def fetch_all_crossref(cutoff_date):
         print(f"正在抓取 Crossref: {topic} ...")
         papers = fetch_crossref_papers(query, cutoff_date)
         results[topic] = [paper for paper in papers if paper["date"] >= cutoff_date.isoformat()][:15]
-        time.sleep(1)
     return results
 
 

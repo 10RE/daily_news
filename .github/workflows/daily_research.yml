@@ -32,6 +32,7 @@ jobs:
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           GITHUB_TOKEN: ${{ github.token }}
+          CROSSREF_MAILTO: ${{ vars.CROSSREF_MAILTO }}
         run: python daily_research.py
 
       - name: Commit report
