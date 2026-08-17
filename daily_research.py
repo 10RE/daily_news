@@ -240,6 +240,7 @@ def fetch_arxiv_rss_papers():
     for category in ARXIV_RSS_CATEGORIES:
         url = f"https://rss.arxiv.org/rss/{category}"
         try:
+            _wait_for_arxiv_slot()
             req = urllib.request.Request(url, headers={"User-Agent": "AutoResearchBot/1.1 (daily research digest)"})
             with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
                 root = ET.fromstring(resp.read())
@@ -268,7 +269,6 @@ def fetch_arxiv_rss_papers():
                     "date": published,
                     "abstract": abstract[:500],
                 })
-        time.sleep(1)
     return papers
 
 
@@ -340,6 +340,7 @@ def fetch_arxiv_recent_papers():
     seen_links = set()
     for category in ARXIV_RSS_CATEGORIES:
         try:
+            _wait_for_arxiv_slot()
             req = urllib.request.Request(
                 f"https://arxiv.org/list/{category}/recent",
                 headers={"User-Agent": "AutoResearchBot/1.1 (daily research digest)"},
@@ -358,7 +359,6 @@ def fetch_arxiv_recent_papers():
                 paper.setdefault("authors", "Unknown")
                 paper["abstract"] = ""
                 papers.append(paper)
-        time.sleep(1)
     return papers
 
 
